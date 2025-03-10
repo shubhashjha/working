@@ -1,76 +1,369 @@
-using System;
-using System.Data.SqlClient;
-using System.IO;
-using System.Linq;
+using HMISAdminPortal.Areas.Shared.Model;
+using HMISAdminPortal.DAL.Common;
+using HMISAdminPortal.DAL.Common.Enums;
+using HMISAdminPortal.DAL.DTOs.Entity;
+using HMISAdminPortal.DAL.DTOs.ResponseDTOs;
+using HMISAdminPortal.Filters;
+using HMISAdminPortal.Web.Helpers;
+using HMISAdminPortal.Web.Services;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Newtonsoft.Json;
+using System.Net;
+using System.Text.RegularExpressions;
+using Utility;
 
-class Program
+namespace HMISAdminPortal.Areas.Login.Controllers
 {
-    static void Main()
+    [Authorize]
+    [Area("Account")]
+    public class LoginController : Controller
     {
-        string connectionString = "Server=ATLANTISPC-784\\SQLEXPRESS;Database=10.0.37;User Id=HMIS;Password=ecw@123;";
-        string destinationFile = @"D:\Build\10_0_37\10_0_37_22_Upgrade\Changes_Sql_Version.txt";
-        string sourceFile = @"D:\Build\10_0_37\10_0_37_22_Upgrade\Changes_Sql.txt";
-
-        try
+        private readonly AppHttpClientService _client;
+        private readonly LoginService _accountService;
+        private readonly ILogger<LoginController> _logger;
+        private readonly IHttpContextAccessor _httpContextAccessor;
+        private readonly AuthorisationService _authorisationService;        
+        private readonly UtilityClass _utilityClass;
+        public LoginController(ILogger<LoginController> logger,
+            AppHttpClientService client,            
+            LoginService accountService,
+            AuthorisationService authorisationService,
+            UtilityClass utilityClass,
+            IHttpContextAccessor httpContextAccessor)
         {
-            // 1. Get Last HMIS Version
-            string lastVersion = GetLastHMISVersion(connectionString);
-            Console.WriteLine($"LastVersion from DB: {lastVersion}");
+            _logger = logger;
+            _client = client;
+            _accountService = accountService;
+            _authorisationService = authorisationService;
+            _httpContextAccessor = httpContextAccessor;
+            _utilityClass = utilityClass;            
+        }
 
-            // 2. Extract main version (e.g., 11.82.4 → 11.82)
-            string editedLastVersion = ExtractMainVersion(lastVersion);
-            Console.WriteLine($"Edited Last Version: {editedLastVersion}");
+        [AllowAnonymous]
+        [ImportModelStateError]
+        public async Task<IActionResult> Index()
+        {
+            string publicKey = string.Empty, privateKey = string.Empty;                     
+            _utilityClass.CreateRSAKeyPairGetKeys(out publicKey, out privateKey);
+            HttpContext.Session.SetString("PublicKey", publicKey);
+            HttpContext.Session.SetString("PrivateKey", privateKey);
+            return View(new UserNameVM());
+        }
 
-            // 3. Check if the version exists in the source file
-            string versionMarker = $"version:{editedLastVersion}";
-            string[] lines = File.ReadAllLines(sourceFile);
-            int versionIndex = Array.FindIndex(lines, line => line.Contains(versionMarker));
-
-            if (File.Exists(destinationFile))
-                File.Delete(destinationFile);
-
-            if (versionIndex == -1)
+        [AllowAnonymous]
+        [HttpPost]
+        public async Task<IActionResult> Index(UserNameVM user)
+        {
+            if (!string.IsNullOrEmpty(user.OTP))
             {
-                // If version not found, copy the entire file
-                File.Copy(sourceFile, destinationFile);
-                Console.WriteLine("Version not found, copied entire file.");
+                if (VerifyOtp(user.OTP))
+                {
+                    VerifyPasswordVM obj = new VerifyPasswordVM()
+                    {
+                        Password = user.Password,
+                        UserName = user.UserName,
+                        PortalUserId = HttpContext.Session.GetString("PortalUserId"),
+                        UserType = HttpContext.Session.GetString("UserType"),
+                        Name = HttpContext.Session.GetString("UserName")
+                    };
+                    await _client.ConfigureHeaderAndRefreshToken(ConvertTo.Long(HttpContext.Session.GetString("PortalUserId")));
+                    if (await _accountService.SetClaimsAndSignIn(obj))
+                    {
+                        return await RedirectToMainPage();
+                    }
+                }
+                else
+                {
+                    user.IsUserVarified = (HttpContext.Session.GetString("IsUserVarified") == "1");
+                    user.Email = HttpContext.Session.GetString("Email");
+                    ModelState.Clear();
+                    ModelState.AddModelError("IncorrectOTP", "Incorrect OTP.");
+                    return View(user);
+                }
+            }
+
+            if (!ModelState.IsValid)
+                return View(user);
+            HttpContext.Session.SetString("EncryptedUsername", user.UserName);
+            if (user.UserName.Length > 50) {
+                user.UserName = Helper.DecryptUserInput(user.UserName, HttpContext.Session.GetString("PrivateKey"));
+                user.Password = Helper.DecryptUserInput(user.Password, HttpContext.Session.GetString("PrivateKey"));
+            }            
+            ApiResponse<UserMaster> response = await _accountService.GetUserDetails(user);
+            if (response.StatusCode == HttpStatusCode.Forbidden)
+            {
+                ModelState.AddModelError("LockedUser", "User account is locked. Please contact system administrator.");
+                user.UserName = string.Empty;
+                user.Password = string.Empty;
+                return View(user);
+            }
+            if (response.StatusCode == HttpStatusCode.BadRequest || response.Data is null || string.IsNullOrEmpty(response.Data?.Email))
+            {
+                user.UserName = null;
+                user.Password = null;
+                ModelState.AddModelError("UserNameLengthExceeded", response.Message);
+                return View(user);
+            }
+            if (response.StatusCode == HttpStatusCode.InternalServerError || response.Data is null || string.IsNullOrEmpty(response.Data?.Email))
+            {
+                user.UserName = null;
+                user.Password = null;
+                ModelState.AddModelError("InternalServerError", "Something went wrong,Please contact Administration.");
+                return View(user);
+            }
+            HttpContext.Session.SetString("PortalUserId", ConvertTo.String(response.Data.PortalUserId));
+            HttpContext.Session.SetString("UserType", ConvertTo.String(response.Data.UserTypeId));
+            HttpContext.Session.SetString("token", response.Data.Token);
+            HttpContext.Session.SetString("Email", response.Data.Email);
+            HttpContext.Session.SetString("UserName", response.Data.UserName);
+            HttpContext.Session.SetString("IsUserVarified", "1");
+            HttpContext.Session.SetString("UserDetailsVM", JsonConvert.SerializeObject(response.Data));
+            user.IsUserVarified = true;
+            user.Email = response.Data.Email;
+            List<AjaxAPIMapping> AjaxMapping = await _authorisationService.GetAllAjaxEndpointMappingList();
+            HttpContext.Session.SetString("AjaxMapping", JsonConvert.SerializeObject(AjaxMapping));
+            await SendOtpEmail("Login", response.Data.Email);           
+            return View(user);
+        }
+        private async Task<ActionResult> RedirectToMainPage()
+        {
+            int UserId = ConvertTo.Integer(HttpContext.Session.GetString("PortalUserId"));
+            bool HasRegistrationRight = await _authorisationService.HasAccessRight(UserId, ConvertTo.String((int)UserModuleEnum.Module.LandingPage));
+            List<AccessRightMasterDto> list = await _authorisationService.GetAuthorisedModules(UserId);            
+            _logger.LogInformation($"----------------------------------------------------" + Environment.NewLine +
+                $"Login Successfull With PortalUserId {HttpContext.Session.GetString("PortalUserId")}" + Environment.NewLine +                
+                $"DateTime {DateTime.Now.ToString()}");
+
+            if (HasRegistrationRight || (list is not null && list.Count > 0))
+            {
+                return RedirectToAction("Index", "Home", new { area = "MainMasters" });
             }
             else
             {
-                // Copy lines from found version onward
-                File.WriteAllLines(destinationFile, lines.Skip(versionIndex));
-                Console.WriteLine($"Version found at line {versionIndex}, copied from this point onward.");
+                return RedirectToAction("Index", "Unauthorize", new { area = "Account" });
             }
         }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Error: {ex.Message}");
-        }
-    }
 
-    static string GetLastHMISVersion(string connectionString)
-    {
-        string version = "";
-        using (SqlConnection conn = new SqlConnection(connectionString))
+        [AllowAnonymous]
+        [HttpGet("Forgot")]        
+        public async Task<IActionResult> ForgotPassword()
         {
-            conn.Open();
-            using (SqlCommand cmd = new SqlCommand("SELECT Value FROM ItemKeys WHERE Name = 'Server_Version'", conn))
+            return View(new ForgotPasswordVM());
+        }
+
+        [AllowAnonymous]        
+        [HttpPost("Forgot")]
+        [ValidateAntiForgeryToken]
+        public async Task<IActionResult> ForgotPassword(ForgotPasswordVM forgotPassword)
+        {
+            if (!string.IsNullOrEmpty(forgotPassword.UserName) &&
+                string.IsNullOrEmpty(forgotPassword.NewPassword) &&
+                string.IsNullOrEmpty(forgotPassword.ConfirmPassword))
             {
-                object result = cmd.ExecuteScalar();
-                if (result != null)
-                    version = result.ToString();
+                HttpContext.Session.SetString("EncryptedUsername", forgotPassword.UserName);
             }
+            forgotPassword.UserName = string.IsNullOrWhiteSpace(HttpContext.Session.GetString("EncryptedUsername")) ? forgotPassword.UserName : HttpContext.Session.GetString("EncryptedUsername");
+            if (!string.IsNullOrEmpty(forgotPassword.UserName) && string.IsNullOrEmpty(forgotPassword.ConfirmPassword) && string.IsNullOrEmpty(forgotPassword.NewPassword))
+            {
+                if (forgotPassword.UserName.Length > 50) 
+                {
+                    forgotPassword.UserName = Helper.DecryptUserInput(forgotPassword.UserName, HttpContext.Session.GetString("PrivateKey"));
+                }
+                string validateMsg = ValidateUserName(forgotPassword.UserName);
+                if (!string.IsNullOrEmpty(validateMsg)) 
+                {
+                    forgotPassword.IsEmailSent = false;
+                    ModelState.AddModelError("UserNameNotfound", validateMsg);
+                    return View(forgotPassword);
+                }                
+                ApiResponse<string> response = await _accountService.GetUserEmail(forgotPassword.UserName);
+                if (!string.IsNullOrEmpty(response.Data))
+                {
+                    await SendOtpEmail("ForgotPassword", response.Data);
+                    forgotPassword.IsVerifiedUser = true;
+                    ModelState.Clear();
+                    return View(forgotPassword);
+                }
+                else
+                {
+                    ModelState.Remove("NewPassword");
+                    ModelState.Remove("ConfirmPassword");
+                    forgotPassword.IsEmailSent = false;
+                    ModelState.AddModelError("UserNameNotfound", "User Name not found or Inactive User Name");
+                    return View(forgotPassword);
+                }
+            }
+            ModelState.Remove("NewPassword");
+            ModelState.Remove("ConfirmPassword");
+            forgotPassword.NewPassword = Helper.DecryptUserInput(forgotPassword.NewPassword, HttpContext.Session.GetString("PrivateKey"));
+            forgotPassword.ConfirmPassword = Helper.DecryptUserInput(forgotPassword.ConfirmPassword, HttpContext.Session.GetString("PrivateKey"));
+            forgotPassword.UserName = Helper.DecryptUserInput(forgotPassword.UserName, HttpContext.Session.GetString("PrivateKey"));
+            if (!(forgotPassword.NewPassword == forgotPassword.ConfirmPassword))
+            {
+                forgotPassword.NewPassword = forgotPassword.ConfirmPassword = string.Empty;
+                ModelState.AddModelError("passwordsnotmatch", "passwords does not match");
+                return View(forgotPassword);
+            }
+            bool IsOtpVerified = _accountService.ValidateOtp(forgotPassword.Otp);
+            if (IsOtpVerified)
+            {
+                UpdatePasswordVM updatePassword = new()
+                {
+                    NewPassword = forgotPassword.NewPassword,
+                    ConfirmPassword = forgotPassword.ConfirmPassword,
+                    UserName = forgotPassword.UserName,
+                    IsFromForgotPassword = true
+                };
+                bool IsPasswordReset = await _accountService.UpdateUserPassword(updatePassword);
+                if (!IsPasswordReset)
+                {
+                    ModelState.AddModelError("PasswordUpdateError", "Password not updated,Please contact Support Team");
+                }
+                ViewBag.IsPasswordReset = IsPasswordReset;
+            }
+            else
+            {
+                ModelState.AddModelError("OTPNotVerified", "OTP verification failed.");
+            }
+            return View(forgotPassword);
         }
-        return version;
-    }
 
-    static string ExtractMainVersion(string version)
-    {
-        if (string.IsNullOrWhiteSpace(version))
-            return "";
+        [HttpPost]
+        [AllowAnonymous]
+        public bool VerifyOtp(string otp)
+        {
+            string? otpFromSession = HttpContext.Session.GetString("forgotPasswordOtp");
+            string? otpValidTill = HttpContext.Session.GetString("forgotPasswordOtpValidTill");
+            if (string.IsNullOrEmpty(otpValidTill))
+            {
+                return false;
+            }
+            if (string.IsNullOrEmpty(otpFromSession) || string.IsNullOrEmpty(otp))
+            {
+                return false;
+            }
+            if (otp.Trim().Equals(otpFromSession) && DateTime.Now.Ticks <= ConvertTo.Long(otpValidTill))
+            {
+                return true;
+            }
+            return false;
+        }
 
-        string[] parts = version.Split('.');
-        return parts.Length > 2 ? string.Join(".", parts.Take(2)) : version;
+        public async Task Logout()
+        {
+            await _accountService.Logout();
+        }
+
+        [HttpGet("UpdatePassword")]        
+        public async Task<IActionResult> UpdatePassword()
+        {
+            UpdatePasswordVM? updatePassword = JsonConvert.DeserializeObject<UpdatePasswordVM>(HttpContext.Session.GetString("UserDetailsVM"));
+            if (updatePassword is null)
+            {
+                await Logout();
+                return RedirectToAction("Index", "Login", new { area = "Account" });
+            }
+            updatePassword.UserType = EnumHelper.GetEnumDisplayName(ConvertTo.Integer(updatePassword.UserTypeId), typeof(UserType.UserTypeEnum));
+            updatePassword.UserTypeId = updatePassword.UserTypeId;
+            return View(updatePassword);
+        }
+
+        [HttpPost("UpdatePassword")]
+        [ValidateAntiForgeryToken]
+        public async Task<IActionResult> UpdatePassword(UpdatePasswordVM updatePassword)
+        {
+            if (string.IsNullOrEmpty(updatePassword.UserName))
+                updatePassword.UserName = HttpContext.Session.GetString("EncryptedUsername");
+
+            ModelState.Remove("NewPassword");
+            ModelState.Remove("ConfirmPassword");
+            ModelState.Remove("Password");
+            if (!ModelState.IsValid)
+            {
+                return View(updatePassword);
+            }
+            updatePassword.Password = Helper.DecryptUserInput(updatePassword.Password, HttpContext.Session.GetString("PrivateKey"));
+            updatePassword.ConfirmPassword = Helper.DecryptUserInput(updatePassword.ConfirmPassword, HttpContext.Session.GetString("PrivateKey"));
+            updatePassword.NewPassword = Helper.DecryptUserInput(updatePassword.NewPassword, HttpContext.Session.GetString("PrivateKey"));
+            updatePassword.UserName = Helper.DecryptUserInput(updatePassword.UserName, HttpContext.Session.GetString("PrivateKey"));
+            updatePassword.UserTypeId = updatePassword.UserTypeId;
+            updatePassword.UserType = EnumHelper.GetEnumDisplayName(ConvertTo.Integer(updatePassword.UserTypeId), typeof(UserType.UserTypeEnum));
+            if (!(updatePassword.NewPassword == updatePassword.ConfirmPassword))
+            {
+                ModelState.AddModelError("ConfirmPassword", "Passwords does not match");
+                updatePassword.Password = updatePassword.NewPassword = updatePassword.ConfirmPassword = string.Empty;
+                return View(updatePassword);
+            }
+            else if ((updatePassword.ConfirmPassword == updatePassword.Password) || (updatePassword.NewPassword == updatePassword.Password))
+            {
+                ModelState.AddModelError("DuplicatePassword", "New password can not be same as current password");
+                ViewBag.PasswordChanged = false;
+            }
+            else
+            {                
+                bool IsPasswordChanged = await _accountService.UpdateUserPassword(updatePassword);
+                if (!IsPasswordChanged)
+                {
+                    ModelState.AddModelError("PasswordUpdateError", "Current Password is incorrect");
+                }
+                ViewBag.PasswordChanged = IsPasswordChanged;
+            }            
+            return View(updatePassword);
+        }
+
+        [HttpGet("BackToLogin")]
+        public async Task<IActionResult> BackToLogin()
+        {
+            await Logout();
+            return RedirectToAction("Index");
+        }
+        private async Task SendOtpEmail(string operation, string email)
+        {
+            string otp = _accountService.GenerateOtpForForgotPassword();
+            HttpContext.Session.SetString("forgotPasswordOtp", otp);
+            HttpContext.Session.SetString("forgotPasswordOtpValidTill", ConvertTo.String(DateTime.Now.AddMinutes(10).Ticks));
+            EmailResultVM emailResult = await _accountService.SendEmail(operation, email, otp);
+        }
+        
+        [AllowAnonymous]
+        [HttpGet("GetPublicKey")]
+        public async Task<JsonResult> GetPublicKey()
+        {
+            return Json(HttpContext.Session.GetString("PublicKey"));
+        }
+
+        [AllowAnonymous]
+        [HttpGet("ResendOtp")]
+        public async Task ResendOtp(string userName)
+        {
+            ApiResponse<string> response = await _accountService.GetUserEmail(userName);
+            if (!string.IsNullOrEmpty(response.Data))
+            {
+                await SendOtpEmail("ForgotPassword", response.Data);                                
+            }            
+        }
+
+
+        private string ValidateUserName(string userName) 
+        {            
+            if (string.IsNullOrEmpty(userName))
+            {
+                return "User Name Required.";
+            }
+            if (userName.Length > 50)
+            {
+                return "Username should be less than 50 characters.";                
+            }
+            var regex = @"^[a-zA-Z0-9_.]*$";
+            var match = Regex.Match(userName, regex, RegexOptions.IgnoreCase);
+            if (!match.Success)
+            {
+                return "Only alphabets, numbers, dots & underscores are allowed.";                
+            }
+            return string.Empty;
+        }
     }
 }
 
@@ -81,119 +374,229 @@ class Program
 
 
 
-using System;
-using System.Data.SqlClient;
-using System.IO;
-using System.Linq;
-using System.Text.RegularExpressions;
 
-class Program
+
+
+
+
+
+
+
+
+
+
+
+
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using HMISAdminPortal.Areas.Shared;
+using HMISAdminPortal.Web.Services;
+
+namespace HMISAdminPortal.Areas.Account.Controllers
 {
-    static void Main()
+    [Authorize]
+    [Area("Account")]
+    public class UnauthorizeController(BaseDependency baseDependency) : BasicController(baseDependency)
     {
-        string connectionString = "Server=ATLANTISPC-784\\SQLEXPRESS;Database=10.0.37;User Id=HMIS;Password=ecw@123;";
-        string sourceFile = @"D:\Build\10_0_37\10_0_37_22_Upgrade\Changes_Sql.txt";
-
-        try
+        [Route("access-denied")]
+        public IActionResult Index()
         {
-            // 1. Get Last Executed Changeset ID
-            string lastExecutedChangeset = GetLastExecutedChangeset(connectionString);
-            Console.WriteLine($"Last Executed Changeset: {lastExecutedChangeset}");
-
-            // 2. Read SQL File & Find Next Execution Start Point
-            string[] lines = File.ReadAllLines(sourceFile);
-            int startIndex = FindNextChangesetIndex(lines, lastExecutedChangeset);
-
-            if (startIndex == -1)
-            {
-                Console.WriteLine("No new changesets to execute.");
-                return;
-            }
-
-            // 3. Extract SQL Statements after the last executed changeset
-            string sqlToExecute = string.Join(Environment.NewLine, lines.Skip(startIndex));
-
-            // 4. Execute SQL Statements
-            ExecuteSQL(sqlToExecute, connectionString);
-
-            // 5. Update Last Executed Changeset in DB
-            string newLastChangeset = ExtractLastChangeset(sqlToExecute);
-            if (!string.IsNullOrEmpty(newLastChangeset))
-            {
-                UpdateLastExecutedChangeset(connectionString, newLastChangeset);
-                Console.WriteLine($"Updated Last Executed Changeset to: {newLastChangeset}");
-            }
+            return View();
         }
-        catch (Exception ex)
+        [Route("error")]
+        public IActionResult ErrorPage()
         {
-            Console.WriteLine($"Error: {ex.Message}");
+            return View();
         }
     }
+}
 
-    static string GetLastExecutedChangeset(string connectionString)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+using AspNetCoreHero.ToastNotification.Abstractions;
+using HMISAdminPortal.Areas.Shared;
+using HMISAdminPortal.DAL.Common.Enums;
+using HMISAdminPortal.DAL.DTOs.Entity;
+using HMISAdminPortal.Web.Filters;
+using HMISAdminPortal.Web.Helpers;
+using HMISAdminPortal.Web.Services;
+using Microsoft.AspNetCore.Mvc;
+using Newtonsoft.Json;
+using System.Data;
+using System.Reflection;
+
+namespace HMISAdminPortal.Web.Areas.Common.Controller
+{
+    [Area("Common")]    
+    public class CommonController : BasicController
     {
-        string changesetId = "";
-        using (SqlConnection conn = new SqlConnection(connectionString))
+        private readonly CommonService _commonService;
+        private readonly INotyfService _notyfService;
+        private readonly ILogger<CommonController> _logger;
+        public CommonController(CommonService commonService, INotyfService notyfService, ILogger<CommonController> logger, BaseDependency baseDependency) : base(baseDependency)
         {
-            conn.Open();
-            using (SqlCommand cmd = new SqlCommand("SELECT Value FROM ItemKeys WHERE Name = 'LastExecutedChangeset'", conn))
-            {
-                object result = cmd.ExecuteScalar();
-                if (result != null)
-                    changesetId = result.ToString();
-            }
+            _commonService = commonService;
+            _notyfService = notyfService;
+            _logger = logger;
         }
-        return changesetId;
-    }
 
-    static int FindNextChangesetIndex(string[] lines, string lastChangeset)
-    {
-        if (string.IsNullOrWhiteSpace(lastChangeset))
-            return 0; // Execute from the beginning if no previous changeset exists
-
-        for (int i = 0; i < lines.Length; i++)
+        [Route("CommonSettings")]
+        [TypeFilter(typeof(CustomAuthorisationFilter), Arguments = [new int[] { (int)UserModuleEnum.Module.Settings }])]
+        public async Task<ViewResult> Index()
         {
-            if (lines[i].Contains($"--changeset") && lines[i].Contains(lastChangeset))
+            List<ItemKeyViewModel> vm = await _commonService.GetSettings();
+            if (TempData["FormSubmitted"] is null)
             {
-                return i + 1; // Start from the next line after the matched changeset
+                TempData["FormSubmitted"] = string.Empty;
             }
+            return View(GetItemkeyObj(vm));
         }
-        return -1;
-    }
 
-    static void ExecuteSQL(string sqlCommands, string connectionString)
-    {
-        using (SqlConnection conn = new SqlConnection(connectionString))
+        [HttpPost("CommonSettings")]
+        [TypeFilter(typeof(CustomAuthorisationFilter), Arguments = [new int[] { (int)UserModuleEnum.Module.Settings }])]
+        public async Task<IActionResult> CommonSetting(CommonSettingViewModel itemKeys)
         {
-            conn.Open();
-            using (SqlCommand cmd = conn.CreateCommand())
+            if (!ModelState.IsValid)
             {
-                cmd.CommandText = sqlCommands;
-                cmd.ExecuteNonQuery();
+                return View(itemKeys);
             }
-        }
-        Console.WriteLine("SQL Execution Completed.");
-    }
-
-    static string ExtractLastChangeset(string sqlContent)
-    {
-        var match = Regex.Match(sqlContent, @"--changeset\s+[^\s:]+:(\d+)");
-        return match.Success ? match.Groups[1].Value : "";
-    }
-
-    static void UpdateLastExecutedChangeset(string connectionString, string newChangeset)
-    {
-        using (SqlConnection conn = new SqlConnection(connectionString))
-        {
-            conn.Open();
-            using (SqlCommand cmd = new SqlCommand(@"
-                IF EXISTS (SELECT * FROM ItemKeys WHERE Name = 'LastExecutedChangeset')
-                    UPDATE ItemKeys SET Value = @newChangeset WHERE Name = 'LastExecutedChangeset'
-                ELSE
-                    INSERT INTO ItemKeys (Name, Value, LocationId) VALUES ('LastExecutedChangeset', @newChangeset, 1)", conn))
+            bool IsUpdated = await _commonService.SaveSettings(GetCommonSettingObj(itemKeys));
+            if (IsUpdated)
             {
-                cmd.Parameters.AddWithValue("@newChangeset", newChangeset);
-                cmd.ExecuteNonQuery();
+                TempData["FormSubmitted"] = "Success";
+            }
+            else
+            {
+                TempData["FormSubmitted"] = "Error";
+            }
+            List<ItemKeyViewModel> vm = await _commonService.GetSettings();
+            return View("Index");
+        }
+
+        [NonAction]
+        private List<ItemKeyViewModel> GetCommonSettingObj(CommonSettingViewModel itemKeys)
+        {
+            List<ItemKeyViewModel> itemList = new List<ItemKeyViewModel>();
+            PropertyInfo[] properties = typeof(CommonSettingViewModel).GetProperties();            
+            foreach (PropertyInfo property in properties)
+            {               
+                ItemKeyViewModel obj = new ItemKeyViewModel()
+                {
+                    Name = property.Name,
+                    Value = ConvertTo.String(property.GetValue(itemKeys))
+                };
+                itemList.Add(obj);
+            }            
+            return itemList;
+        }
+
+        [NonAction]
+        private CommonSettingViewModel GetItemkeyObj(List<ItemKeyViewModel> vm)
+        {
+            CommonSettingViewModel commonSetting = new CommonSettingViewModel()
+            {
+                MediatorApiUrl = vm.Where(x => x.Name == "MediatorApiUrl").Select(x => x.Value).First(),
+                AbdmHealthIdUrl = vm.Where(x => x.Name == "AbdmHealthIdUrl").Select(x => x.Value).First(),
+                AbdmPhrUrl = vm.Where(x => x.Name == "AbdmPhrUrl").Select(x => x.Value).First(),
+                CareContextURL = vm.Where(x => x.Name == "CareContextURL").Select(x => x.Value).First(),
+                PHRNotificactionURL = vm.Where(x => x.Name == "PHRNotificactionURL").Select(x => x.Value).First(),
+                DeepSMSURL = vm.Where(x => x.Name == "DeepSMSURL").Select(x => x.Value).First(),
+                DiagnosticURL = vm.Where(x => x.Name == "DiagnosticURL").Select(x => x.Value).First(),
+                DischargeSummaryURL = vm.Where(x => x.Name == "DischargeSummaryURL").Select(x => x.Value).First(),
+                HealthDocumentRecordURL = vm.Where(x => x.Name == "HealthDocumentRecordURL").Select(x => x.Value).First(),
+                ImmunizationRecordURL = vm.Where(x => x.Name == "ImmunizationRecordURL").Select(x => x.Value).First(),
+                OPConsultationURL = vm.Where(x => x.Name == "OPConsultationURL").Select(x => x.Value).First(),
+                PrescriptionsURL = vm.Where(x => x.Name == "PrescriptionsURL").Select(x => x.Value).First(),
+                WellnessRecordURL = vm.Where(x => x.Name == "WellnessRecordURL").Select(x => x.Value).First(),
+                TokenURL = vm.Where(x => x.Name == "TokenURL").Select(x => x.Value).First()
+            };
+            return commonSetting;
+        }
+
+        [Route("SqlEditor")]
+        [TypeFilter(typeof(CustomAuthorisationFilter), Arguments = [new int[] { (int)UserModuleEnum.Module.SQLEditor }])]
+        public IActionResult SqlEditor()
+        {
+            return View(new SqlEditorModel());
+        }
+
+        [HttpPost("SqlEditor")]        
+        [TypeFilter(typeof(CustomAuthorisationFilter), Arguments = [new int[] { (int)UserModuleEnum.Module.SQLEditor }])]
+        public async Task<IActionResult> SqlEditor(SqlEditorModel? sqlEditorModel)
+        {
+            try
+            {
+                var result = await _commonService.SqlEditorList(sqlEditorModel.Query);
+                
+                if (result != null && !ConvertTo.String(result).Contains("Not Supported"))
+                {
+                    DataTable dt = (DataTable)JsonConvert.DeserializeObject(result.ToString(), (typeof(DataTable)));
+                    
+                    sqlEditorModel.dtData = dt;
+                }
+                else
+                {
+                    TempData["AlertMessge"] = ConvertTo.String(result);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message);
+            }
+            ModelState.Clear();
+            return View(sqlEditorModel);
+        }
+
+        [Route("SettingMaster")]
+        [TypeFilter(typeof(CustomAuthorisationFilter), Arguments = [new int[] { (int)UserModuleEnum.Module.CommonSettings }])]
+        public async Task<IActionResult> CommonSettings()
+        {
+            List<ItemKeyViewModel> vm = await _commonService.GetCommonSettings();
+            if (TempData["FormSubmitted"] is null)
+            {
+                TempData["FormSubmitted"] = string.Empty;
+            }
+            return View(vm);
+        }
+
+        [HttpPost("SaveCommonSettings")]        
+        public async Task<IActionResult> SaveCommonSettings(string data, string key, string nonce)
+        {
+            string decryptedKey = Helper.DecryptUserInput(key, HttpContext.Session.GetString("PrivateKey"));
+            string decryptedSalt = Helper.DecryptUserInput(nonce, HttpContext.Session.GetString("PrivateKey"));
+            List<ItemKeyViewModel> itemKeyViews = Helper.DecryptAESGCM<List<ItemKeyViewModel>>(data, decryptedKey, decryptedSalt);
+            if (!ModelState.IsValid)
+            {
+                return View(itemKeyViews);
+            }
+            if (itemKeyViews.Any())
+            {
+                bool IsUpdated = await _commonService.SaveSettings(itemKeyViews.ToList());
+                if (IsUpdated)
+                {
+                    return Json(new { success = true, message = "Settings Saved Successfully." });
+                }
+                else
+                {
+                    return Json(new { success = false, message = "Something went wrong !" });
+                }
+            }
+            else
+            {
+                return Json(new { success = false, message = "Something went wrong !" });
             }
         }
     }
@@ -202,95 +605,1093 @@ class Program
 
 
 
-using System;
-using System.Data.SqlClient;
-using System.IO;
 
-class Program
+
+
+
+
+
+
+
+
+
+using AspNetCoreHero.ToastNotification.Abstractions;
+using HMISAdminPortal.Areas.Shared;
+using HMISAdminPortal.Web.Services;
+using Microsoft.AspNetCore.Mvc;
+
+namespace HMISAdminPortal.Web.Areas.MainMasters.Controllers
 {
-    static void Main()
+    [Area("MainMasters")]    
+    public class HomeController : BasicController
     {
-        string connectionString = "Server=ATLANTISPC-784\\SQLEXPRESS;Database=10.0.37;User Id=HMIS;Password=ecw@123;";
-        string sqlFilePath = @"D:\Build\10_0_37\10_0_37_22_Upgrade\New_Changes.sql"; // Manually prepared SQL file
-        string latestChangesetId = "14062017180002"; // Manually set new changeset ID
-
-        try
+        private readonly INotyfService _notyfService;
+        private readonly ILogger<HomeController> _logger;
+        public HomeController(INotyfService notyfService, ILogger<HomeController> logger, BaseDependency baseDependency) : base(baseDependency)
         {
-            // Get Last Executed Changeset
-            string lastExecutedChangeset = GetLastExecutedChangeset(connectionString);
-            Console.WriteLine($"Last Executed Changeset: {lastExecutedChangeset}");
+            _notyfService = notyfService;
+            _logger = logger;
+        }
+        public IActionResult Index()
+        {
+            return View();
+        }
+    }
+}
 
-            // Check if there's a newer changeset
-            if (string.Compare(latestChangesetId, lastExecutedChangeset) <= 0)
+
+
+
+
+
+
+
+using DocumentFormat.OpenXml.Wordprocessing;
+using HMISAdminPortal.Areas.Shared;
+using HMISAdminPortal.DAL.Common.Enums;
+using HMISAdminPortal.DAL.DTOs.Entity;
+using HMISAdminPortal.DAL.DTOs.RequestDTOs;
+using HMISAdminPortal.Web.Filters;
+using HMISAdminPortal.Web.Helpers;
+using HMISAdminPortal.Web.Services;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Rendering;
+using System.Globalization;
+
+namespace HMISAdminPortal.Web.Areas.RazorpayConfiguration.Controller
+{
+    [Area("RazorpayConfiguration")]
+    public class RazorpayConfigurationController : BasicController
+    {
+        private readonly ClientListService _clientListService;
+        private readonly PaymentServices _paymentServices;
+        private readonly CancelRazorPayConfigurationServicecs _cancelPaymentservice;
+        private readonly CancelTemplateService _cancelTemplateservice;
+        private readonly ILogger<RazorpayConfigurationController> _logger;
+        private readonly IConfiguration _configuration;
+        public RazorpayConfigurationController(ClientListService clientListService, PaymentServices paymentServices, CancelRazorPayConfigurationServicecs cancelPaymentservice,
+            ILogger<RazorpayConfigurationController> logger,
+            IConfiguration configuration,CancelTemplateService canceltemplateservice,
+            BaseDependency baseDependency) : base(baseDependency)
+        {
+            _clientListService = clientListService;
+            _paymentServices = paymentServices;
+            _cancelPaymentservice = cancelPaymentservice;
+            _cancelTemplateservice = canceltemplateservice;
+            _configuration = configuration;
+            _logger = logger;
+        }
+
+
+        #region  "Refund Transaction Report"
+
+        [Route("RefundTrancationReport")]
+        [TypeFilter(typeof(CustomAuthorisationFilter), Arguments = [new int[] { (int)UserModuleEnum.Module.RefundTransactionReport }])]
+        public async Task<IActionResult> RefundTrancationReport()
+        {
+            RefundFailedTransactionViewModel responseModel = new RefundFailedTransactionViewModel();
+            int pageSize = 20, pageNumber = 1;
+            string fromDate = DateTime.Now.AddMonths(-1).ToString("dd/MM/yyyy", CultureInfo.InvariantCulture);
+            string toDate = DateTime.Now.ToString("dd/MM/yyyy", CultureInfo.InvariantCulture);
+            try
             {
-                Console.WriteLine("No new changesets to execute.");
-                return;
+                List<RefundFailedTransactionDTO> response = await _paymentServices.GetAllFailedRazorPayTransactionDetails(pageSize, pageNumber, string.Empty, fromDate, toDate);
+                if (response != null)
+                {
+                    responseModel = new RefundFailedTransactionViewModel()
+                    {
+                        TotalCount = response != null ? (response[0].TotalCount.HasValue ? response[0].TotalCount.Value : 0) : 0,
+                        FailedTransactionList = response
+                    };
+                }
+                return View(responseModel);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message, ex);
+                return View(responseModel);
+            }
+        }
+
+        [Route("FailedTransactionList")]        
+        public async Task<PartialViewResult> _FailedTransactionList(string data, string key, string nonce)
+        {
+            RefundFailedTransactionViewModel responseModel = new RefundFailedTransactionViewModel();
+            try
+            {
+                string decryptedKey = Helper.DecryptUserInput(key, HttpContext.Session.GetString("PrivateKey"));
+                string decryptedSalt = Helper.DecryptUserInput(nonce, HttpContext.Session.GetString("PrivateKey"));
+                PaginationVM paginationObj = Helper.DecryptAESGCM<PaginationVM>(data, decryptedKey, decryptedSalt);
+                List<RefundFailedTransactionDTO> response = await _paymentServices.GetAllFailedRazorPayTransactionDetails(paginationObj.pageSize, paginationObj.pageNumber, paginationObj.searchTerm, paginationObj.fromDate, paginationObj.toDate);
+                if (response != null)
+                {
+                    responseModel = new RefundFailedTransactionViewModel()
+                    {
+                        TotalCount = response != null ? (response[0].TotalCount.HasValue ? response[0].TotalCount.Value : 0) : 0,
+                        FailedTransactionList = response
+                    };
+                }
+                return PartialView("_FailedTransactionList", responseModel);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message, ex);
+                return PartialView("_FailedTransactionList", responseModel);
+            }
+        }
+
+        #endregion
+
+        #region "CancelPayment"
+
+        [Route("CancelPayment")]
+        [TypeFilter(typeof(CustomAuthorisationFilter), Arguments = [new int[] { (int)UserModuleEnum.Module.CancelRazorpayConfiguration }])]
+        public async Task<IActionResult> CancelPayment()
+        {
+            int pageSize = 20, pageNumber = 1;
+            string searchTerm = string.Empty;
+            RazorPayCancellationDetailVM responseModel = new RazorPayCancellationDetailVM();
+            try
+            {
+                List<RazorPayCancellationDetail> response = await _cancelPaymentservice.GetClientList(pageSize, pageNumber, searchTerm);
+                List<Template> templates = await _cancelPaymentservice.GetTemplates();
+                if (response != null)
+                {
+                    responseModel = new RazorPayCancellationDetailVM()
+                    {
+                        TotalCount = (response != null && response.Count > 0) ? (response[0].TotalCount.HasValue ? response[0].TotalCount.Value : 0) : 0,
+                        RazorPayCancellationDetailList = response,
+                        ProductTagList = GetProductTags(),
+                        CancelTemplateList = templates
+                    };
+                }
+                return View(responseModel);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message, ex);
+                return View(responseModel);
+            }
+        }
+
+        [Route("ListCancelPaymentList")]        
+        public async Task<PartialViewResult> _ListCancelPaymentList(string data, string key, string nonce)
+        {
+            RazorPayCancellationDetailVM responseModel = new RazorPayCancellationDetailVM();
+            try
+            {
+                string decryptedKey = Helper.DecryptUserInput(key, HttpContext.Session.GetString("PrivateKey"));
+                string decryptedSalt = Helper.DecryptUserInput(nonce, HttpContext.Session.GetString("PrivateKey"));
+                PaginationVM paginationObj = Helper.DecryptAESGCM<PaginationVM>(data, decryptedKey, decryptedSalt);
+                List<Template> templates = await _cancelPaymentservice.GetTemplates();
+                List<RazorPayCancellationDetail> response = await _cancelPaymentservice.GetClientList(paginationObj.pageSize, paginationObj.pageNumber, paginationObj.searchTerm);
+                if (response != null)
+                {
+                    responseModel = new RazorPayCancellationDetailVM()
+                    {
+                        TotalCount = (response != null && response.Count > 0) ? (response[0].TotalCount.HasValue ? response[0].TotalCount.Value : 0) : 0,
+                        RazorPayCancellationDetailList = response,
+                        ProductTagList = GetProductTags(),
+                        CancelTemplateList = templates
+                    };
+                }
+                return PartialView("_ListCancelPaymentList", responseModel);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message, ex);
+                return PartialView("_ListCancelPaymentList", responseModel);
+            }
+        }
+
+        #endregion
+
+        #region  "Payment Transaction Report"
+
+        [Route("RazorpayTrancationReport")]
+        [TypeFilter(typeof(CustomAuthorisationFilter), Arguments = [new int[] { (int)UserModuleEnum.Module.RazorpayReport }])]
+        public async Task<IActionResult> RazorpayTrancationReport()
+        {
+            PaymentTransactionListViewModel responseModel = new PaymentTransactionListViewModel();
+            int pageSize = 20, pageNumber = 1;
+            string fromDate = DateTime.Now.AddMonths(-1).ToString("dd/MM/yyyy", CultureInfo.InvariantCulture);
+            string toDate = DateTime.Now.ToString("dd/MM/yyyy", CultureInfo.InvariantCulture);
+            try
+            {
+                List<PaymentTransactionDTO> response = await _paymentServices.GetAllPaymentTransactionDetails(pageSize, pageNumber, string.Empty, fromDate, toDate);
+                if (response != null)
+                {
+                    responseModel = new PaymentTransactionListViewModel()
+                    {
+                        TotalCount = response != null ? (response[0].TotalCount.HasValue ? response[0].TotalCount.Value : 0) : 0,
+                        TransactionList = response
+                    };
+                }
+                return View(responseModel);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message, ex);
+                return View(responseModel);
+            }
+        }
+
+        [Route("PaymentList")]
+        public async Task<ActionResult> _PaymentList(string data, string key, string nonce)
+        {
+            PaymentTransactionListViewModel responseModel = new PaymentTransactionListViewModel();
+            try
+            {
+                string decryptedKey = Helper.DecryptUserInput(key, HttpContext.Session.GetString("PrivateKey"));
+                string decryptedSalt = Helper.DecryptUserInput(nonce, HttpContext.Session.GetString("PrivateKey"));
+                PaginationVM paginationObj = Helper.DecryptAESGCM<PaginationVM>(data, decryptedKey, decryptedSalt);
+                List<PaymentTransactionDTO> response = await _paymentServices.GetAllPaymentTransactionDetails(paginationObj.pageSize, paginationObj.pageNumber, paginationObj.searchTerm, paginationObj.fromDate, paginationObj.toDate);
+                if (response is not null)
+                {
+                    responseModel = new PaymentTransactionListViewModel()
+                    {
+                        TotalCount = response != null ? (response[0].TotalCount.HasValue ? response[0].TotalCount.Value : 0) : 0,
+                        TransactionList = response
+                    };
+                }
+                return PartialView("_PaymentList", responseModel);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message, ex);
+                return PartialView("_PaymentList", responseModel);
+            }
+        }
+
+        #endregion
+
+        #region "Save Configuration"
+        [TypeFilter(typeof(CustomAuthorisationFilter), Arguments = [new int[] { (int)UserModuleEnum.Module.RazorpayConfiguration }])]
+        public async Task<ViewResult> Index()
+        {
+            int pageSize = 20, pageNumber = 1;
+            string searchTerm = string.Empty;
+            ClientListViewModel responseModel = new ClientListViewModel();
+            try
+            {
+                List<ClientListModel> response = await _clientListService.GetClientList(pageSize, pageNumber, searchTerm);
+                if (response != null)
+                {
+                    responseModel = new ClientListViewModel()
+                    {
+                        TotalCount = response != null ? (response[0].TotalCount.HasValue ? response[0].TotalCount.Value : 0) : 0,
+                        ClientList = response
+                    };
+                }
+                return View(responseModel);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message, ex);
+                return View(responseModel);
+            }
+        }
+
+        public async Task<PartialViewResult> _ListClientServices(string data, string key, string nonce)
+        {
+            string decryptedKey = Helper.DecryptUserInput(key, HttpContext.Session.GetString("PrivateKey"));
+            string decryptedSalt = Helper.DecryptUserInput(nonce, HttpContext.Session.GetString("PrivateKey"));
+            PaginationVM paginationObj = Helper.DecryptAESGCM<PaginationVM>(data, decryptedKey, decryptedSalt);
+            ClientListViewModel responseModel = new ClientListViewModel();
+            try
+            {
+                List<ClientListModel> response = await _clientListService.GetClientList(paginationObj.pageSize, paginationObj.pageNumber, paginationObj.searchTerm);
+                if (response != null)
+                {
+                    responseModel = new ClientListViewModel()
+                    {
+                        TotalCount = (response[0].TotalCount.HasValue ? response[0].TotalCount.Value : 0),
+                        ClientList = response
+                    };
+                }
+                return PartialView("_RazorpayConfiguration", responseModel);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message, ex);
+                return PartialView("_RazorpayConfiguration", responseModel);
+            }
+        }
+
+        [HttpPost("SaveClientDetail")]        
+        public async Task<IActionResult> SaveClientDetail(string data, string key, string nonce)
+        {
+            string decryptedKey = Helper.DecryptUserInput(key, HttpContext.Session.GetString("PrivateKey"));
+            string decryptedSalt = Helper.DecryptUserInput(nonce, HttpContext.Session.GetString("PrivateKey"));
+            ClientListModel clientmodel = Helper.DecryptAESGCM<ClientListModel>(data, decryptedKey, decryptedSalt);
+            bool IsUpdated = await _clientListService.SaveClientDetail(clientmodel);
+            if (!IsUpdated)
+            {
+                return Json(new { success = false, message = "Something went wrong ! Please try again." });
+            }
+            else
+            {
+                return Json(new { success = true, message = "Record Updated Successfully." });
+            }
+        }
+
+        [HttpPost("GetClientDetail")]        
+        public async Task<JsonResult> GetClientDetail(string data, string key, string nonce)
+        {
+            try
+            {
+                string decryptedKey = Helper.DecryptUserInput(key, HttpContext.Session.GetString("PrivateKey"));
+                string decryptedSalt = Helper.DecryptUserInput(nonce, HttpContext.Session.GetString("PrivateKey"));
+                AjaxRequestModel ajaxModel = Helper.DecryptAESGCM<AjaxRequestModel>(data, decryptedKey, decryptedSalt);
+                var response = await _clientListService.GetClientDetail(ajaxModel.clientId);
+
+                return Json(response);
+            }
+            catch (Exception ex)
+            {
+                return Json(ex.Message);
             }
 
-            // Execute the manually prepared SQL script
-            ExecuteSQLFile(sqlFilePath, connectionString);
-
-            // Update the last executed changeset in the database
-            UpdateLastExecutedChangeset(connectionString, latestChangesetId);
-            Console.WriteLine($"Updated Last Executed Changeset to: {latestChangesetId}");
         }
-        catch (Exception ex)
+
+        #endregion
+
+        #region "CAncel Payment Configuration"
+
+        private List<SelectListItem> GetProductTags()
         {
-            Console.WriteLine($"Error: {ex.Message}");
+            List<SelectListItem> ProductTagList = new List<SelectListItem>();
+
+            ProductTagList = new List<SelectListItem>
+            {
+                new SelectListItem { Text = "Select Product", Value = "0", Selected = true },
+                new SelectListItem() {Text="eClinicalWorks OPRA", Value="13"},
+                new SelectListItem() {Text="HMiS 10i", Value="9"}
+            };
+            return ProductTagList;
+        }
+
+        [Route("GetClientByProductTag")]
+        public async Task<List<Client>> GetClientByProductTag(string data, string key, string nonce)
+        {
+            string decryptedKey = Helper.DecryptUserInput(key, HttpContext.Session.GetString("PrivateKey"));
+            string decryptedSalt = Helper.DecryptUserInput(nonce, HttpContext.Session.GetString("PrivateKey"));
+            AjaxRequestModel ajaxModel = Helper.DecryptAESGCM<AjaxRequestModel>(data, decryptedKey, decryptedSalt);
+            List<Client> Clients = await _cancelPaymentservice.GetClientByProductTag(ajaxModel.ProductTag);
+            return Clients;
+        }
+
+        [HttpPost("SaveCancelConfiguration")]        
+        public async Task<IActionResult> SaveCancelConfiguration(string data, string key, string nonce)
+        {
+            string decryptedKey = Helper.DecryptUserInput(key, HttpContext.Session.GetString("PrivateKey"));
+            string decryptedSalt = Helper.DecryptUserInput(nonce, HttpContext.Session.GetString("PrivateKey"));
+            RazorPayCancellationDetail clientmodel = Helper.DecryptAESGCM<RazorPayCancellationDetail>(data, decryptedKey, decryptedSalt);
+            bool IsUpdated = await _cancelPaymentservice.SaveClientCancelConfigurationDetail(clientmodel);
+            if (!IsUpdated)
+            {
+                return Json(new { success = false, message = "Something went wrong ! Please try again." });
+            }
+            else
+            {
+                return Json(new { success = true, message = "Record Updated Successfully." });
+            }
+        }
+
+        [HttpGet("GetClientCancelDetail")]        
+        public async Task<JsonResult> GetClientCancelDetail(string data, string key, string nonce)
+        {
+            try
+            {
+                string decryptedKey = Helper.DecryptUserInput(key, HttpContext.Session.GetString("PrivateKey"));
+                string decryptedSalt = Helper.DecryptUserInput(nonce, HttpContext.Session.GetString("PrivateKey"));
+                AjaxRequestModel ajaxModel = Helper.DecryptAESGCM<AjaxRequestModel>(data, decryptedKey, decryptedSalt);
+                var response = await _cancelPaymentservice.GetClientCancelConfigurationById(ajaxModel.id);
+
+                return Json(response);
+            }
+            catch (Exception ex)
+            {
+                return Json(ex.Message);
+            }
+        }
+
+        [Route("GetlocationByClient")]
+        public async Task<List<LocationDetailsVM>> GetlocationByClient(string data, string key, string nonce)
+        {
+            string decryptedKey = Helper.DecryptUserInput(key, HttpContext.Session.GetString("PrivateKey"));
+            string decryptedSalt = Helper.DecryptUserInput(nonce, HttpContext.Session.GetString("PrivateKey"));
+            AjaxRequestModel ajaxModel = Helper.DecryptAESGCM<AjaxRequestModel>(data, decryptedKey, decryptedSalt);
+            List<LocationDetailsVM> Locations = await _cancelPaymentservice.GetlocationByClient(ajaxModel.clientId, ajaxModel.ProductTag);
+
+            return Locations;
+        }
+
+        [Route("GetConsultantByLocation")]
+        public async Task<List<ConsultantDetailsVM>> GetConsultantByLocation(string data, string key, string nonce)
+        {
+            string decryptedKey = Helper.DecryptUserInput(key, HttpContext.Session.GetString("PrivateKey"));
+            string decryptedSalt = Helper.DecryptUserInput(nonce, HttpContext.Session.GetString("PrivateKey"));
+            AjaxRequestModel ajaxModel = Helper.DecryptAESGCM<AjaxRequestModel>(data, decryptedKey, decryptedSalt);
+            List<ConsultantDetailsVM> Locations = await _cancelPaymentservice.GetConsultantByLocation(ajaxModel.clientId, ajaxModel.ProductTag, ajaxModel.LocationId);
+            return Locations;
+        }
+
+        #endregion
+
+        #region "Copy Consultant details"
+
+        [Route("LoadCopyConfiguration")]
+        public async Task<ActionResult> LoadCopyConfiguration()
+        {
+            return PartialView("_CopyConfiguration");
+        }
+
+        [Route("GetFromconsultants")]
+        public async Task<List<ConsultantDetailsVM>> GetFromconsultants(string data, string key, string nonce)
+        {
+            string decryptedKey = Helper.DecryptUserInput(key, HttpContext.Session.GetString("PrivateKey"));
+            string decryptedSalt = Helper.DecryptUserInput(nonce, HttpContext.Session.GetString("PrivateKey"));
+            AjaxRequestModel ajaxModel = Helper.DecryptAESGCM<AjaxRequestModel>(data, decryptedKey, decryptedSalt);
+            List<ConsultantDetailsVM> fromconsultants = await _cancelPaymentservice.GetConfiguredConsultantList(ajaxModel.clientId, ajaxModel.ProductTag, ajaxModel.LocationId);
+
+            return fromconsultants;
+        }
+
+        [Route("GetToconsultants")]
+        public async Task<List<ConsultantDetailsVM>> GetToconsultants(string data, string key, string nonce)
+        {
+            string decryptedKey = Helper.DecryptUserInput(key, HttpContext.Session.GetString("PrivateKey"));
+            string decryptedSalt = Helper.DecryptUserInput(nonce, HttpContext.Session.GetString("PrivateKey"));
+            AjaxRequestModel ajaxModel = Helper.DecryptAESGCM<AjaxRequestModel>(data, decryptedKey, decryptedSalt);
+            List<ConsultantDetailsVM> Toconsultants = await _cancelPaymentservice.GetConsultantByLocation(ajaxModel.clientId, ajaxModel.ProductTag, ajaxModel.LocationId);
+            List<ConsultantDetailsVM> fromconsultant = await _cancelPaymentservice.GetConfiguredConsultantList(ajaxModel.clientId, ajaxModel.ProductTag, ajaxModel.LocationId);
+
+            var results = Toconsultants.Where(x => !fromconsultant.Any(y => y.Name == x.Name)).ToList();
+
+            return results;
+        }
+
+
+        
+        [HttpPost("CopyConsultantData")]
+        public async Task<IActionResult> CopyConsultantData(string data, string key, string nonce)
+        {
+            string decryptedKey = Helper.DecryptUserInput(key, HttpContext.Session.GetString("PrivateKey"));
+            string decryptedSalt = Helper.DecryptUserInput(nonce, HttpContext.Session.GetString("PrivateKey"));
+            CopyConsultantVM consultantdata = Helper.DecryptAESGCM<CopyConsultantVM>(data, decryptedKey, decryptedSalt);
+            int IsUpdated = await _cancelPaymentservice.CopyConsultantData(consultantdata);
+
+            if (IsUpdated > 0)
+            {
+                return Json(new { success = true, message = "Record Updated Successfully." });
+            }
+            else if (IsUpdated == -2)
+            {
+                return Json(new { success = false, message = "HIP Facility Id already exists." });
+            }
+            else if (IsUpdated == -1)
+            {
+                return Json(new { success = false, message = "HIU Facility Id already exists" });
+            }
+            else
+            {
+                return Json(new { success = false, message = "Something went wrong !" });
+            }
+        }
+
+        #endregion
+
+        #region "Template"
+        [Route("TemplateCreation")]
+        [TypeFilter(typeof(CustomAuthorisationFilter), Arguments = [new int[] { (int)UserModuleEnum.Module.TemplateCreation }])]
+        public async Task<IActionResult> TemplateCreation()
+        {
+            int pageSize = 20, pageNumber = 1;
+            string searchTerm = string.Empty;
+            CancelTemplateConfigurationViewModel responseModel = new CancelTemplateConfigurationViewModel();
+            try
+            {
+                List<CancelTemplateConfigurationDTO> response = await _cancelTemplateservice.GetTemplateList(pageSize, pageNumber, searchTerm);
+                if (response != null)
+                {
+                    responseModel = new CancelTemplateConfigurationViewModel()
+                    {
+                        TotalCount = (response != null && response.Count > 0) ? (response[0].TotalCount.HasValue ? response[0].TotalCount.Value : 0) : 0,
+                        TemplateConfigList = response
+                    };
+                }
+                return View(responseModel);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message, ex);
+                return View(responseModel);
+            }
+        }
+
+
+        [Route("TemplateConfigurationList")]
+        [TypeFilter(typeof(CustomAuthorisationFilter), Arguments = [new int[] { (int)UserModuleEnum.Module.CancelRazorpayConfiguration }])]
+        public async Task<PartialViewResult> TemplateConfigurationList(string data, string key, string nonce)
+        {
+            CancelTemplateConfigurationViewModel responseModel = new CancelTemplateConfigurationViewModel();
+            try
+            {
+                string decryptedKey = Helper.DecryptUserInput(key, HttpContext.Session.GetString("PrivateKey"));
+                string decryptedSalt = Helper.DecryptUserInput(nonce, HttpContext.Session.GetString("PrivateKey"));
+                PaginationVM paginationObj = Helper.DecryptAESGCM<PaginationVM>(data, decryptedKey, decryptedSalt);
+                List<CancelTemplateConfigurationDTO> response = await _cancelTemplateservice.GetTemplateList(paginationObj.pageSize, paginationObj.pageNumber, paginationObj.searchTerm);
+                if (response != null)
+                {
+                    responseModel = new CancelTemplateConfigurationViewModel()
+                    {
+                        TotalCount = (response != null && response.Count > 0) ? (response[0].TotalCount.HasValue ? response[0].TotalCount.Value : 0) : 0,
+                        TemplateConfigList = response
+                    };
+                }
+                return PartialView("_TemplateConfigurationList", responseModel);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message, ex);
+                return PartialView("_TemplateConfigurationList", responseModel);
+            }
+        }
+
+        [HttpPost("SaveTemplateDetail")]        
+        public async Task<IActionResult> SaveTemplateDetail(string data, string key, string nonce)
+        {
+            string decryptedKey = Helper.DecryptUserInput(key, HttpContext.Session.GetString("PrivateKey"));
+            string decryptedSalt = Helper.DecryptUserInput(nonce, HttpContext.Session.GetString("PrivateKey"));
+            CancelTemplateConfigurationDTO templatetmodel = Helper.DecryptAESGCM<CancelTemplateConfigurationDTO>(data, decryptedKey, decryptedSalt);
+            templatetmodel.EncodedBy =Convert.ToInt32(HttpContext.Session.GetString("PortalUserId"));
+            bool IsUpdated = await _cancelTemplateservice.SaveTemplateDetail(templatetmodel);
+            if (!IsUpdated)
+            {
+                return Json(new { success = false, message = "Template is already in use so please create new one." });
+            }
+            else
+            {
+                return Json(new { success = true, message = "Record Updated Successfully." });
+            }
+        }
+
+        [Route("GetTemplateDetail")]
+        public async Task<JsonResult> GetTemplateDetail(string data, string key, string nonce)
+        {
+            try
+            {
+                string decryptedKey = Helper.DecryptUserInput(key, HttpContext.Session.GetString("PrivateKey"));
+                string decryptedSalt = Helper.DecryptUserInput(nonce, HttpContext.Session.GetString("PrivateKey"));
+                AjaxRequestModel ajaxModel = Helper.DecryptAESGCM<AjaxRequestModel>(data, decryptedKey, decryptedSalt);
+                var response = await _cancelTemplateservice.GetTemplateDetail(ajaxModel.TemplateId);
+
+                return Json(response);
+            }
+            catch (Exception ex)
+            {
+                return Json(ex.Message);
+            }
+
+        }
+        #endregion
+    }
+}
+
+
+
+
+
+
+
+
+using AspNetCoreHero.ToastNotification.Abstractions;
+using HMISAdminPortal.Areas.Shared;
+using HMISAdminPortal.DAL.Common.Enums;
+using HMISAdminPortal.DAL.DTOs.Entity;
+using HMISAdminPortal.DAL.DTOs.RequestDTOs;
+using HMISAdminPortal.Web.Areas.UserConfiguration.ViewModels;
+using HMISAdminPortal.Web.Filters;
+using HMISAdminPortal.Web.Helpers;
+using HMISAdminPortal.Web.Services;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Rendering;
+
+namespace HMISAdminPortal.Web.Areas.UserConfiguration.Controller
+{
+    [Area("UserConfiguration")]
+    [TypeFilter(typeof(CustomAuthorisationFilter), Arguments = [new int[] { (int)UserModuleEnum.Module.UserCreation }])]
+    public class UserConfigurationController : BasicController
+    {
+        private readonly INotyfService _notyfService;
+        private readonly ILogger<UserConfigurationController> _logger;
+        private readonly UserMasterService _accountService;
+        public UserConfigurationController(INotyfService notyfService, UserMasterService accountService, ILogger<UserConfigurationController> logger, BaseDependency baseDependency) : base(baseDependency)
+        {
+            _notyfService = notyfService;
+            _accountService = accountService;
+            _logger = logger;
+        }
+        [HttpGet("UserConfiguration")]
+        public async Task<IActionResult> Index()
+        {
+            UserListVM responseModel = new UserListVM();
+            int pageSize = 20, pageNumber = 1;
+            try
+            {
+                List<UserList> response = await _accountService.GetUserList(pageSize, pageNumber, string.Empty);
+                if (response != null && response.Count > 0)
+                {
+                    responseModel = new UserListVM()
+                    {
+                        TotalCount = response != null ? (response[0].TotalCount.HasValue ? response[0].TotalCount.Value : 0) : 0,
+                        UserList = response,
+                        user = new CreateUserViewModel() { lstUsrType = GetUserType() }
+
+                    };
+                }
+                else
+                {
+                    responseModel = new UserListVM()
+                    {
+                        TotalCount = 0,
+                        UserList = null,
+                        user = new CreateUserViewModel() { lstUsrType = GetUserType() }
+                    };
+                }
+                return View(responseModel);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message, ex);
+                return View(responseModel);
+            }
+        }
+
+        public async Task<PartialViewResult> Index(string data, string key, string nonce)
+        {
+            string decryptedKey = Helper.DecryptUserInput(key, HttpContext.Session.GetString("PrivateKey"));
+            string decryptedSalt = Helper.DecryptUserInput(nonce, HttpContext.Session.GetString("PrivateKey"));
+            PaginationVM paginationObj = Helper.DecryptAESGCM<PaginationVM>(data, decryptedKey, decryptedSalt);
+            UserListVM responseModel = new UserListVM();
+            try
+            {
+                List<UserList> response = await _accountService.GetUserList(paginationObj.pageSize, paginationObj.pageNumber, (string.IsNullOrEmpty(paginationObj.searchTerm)) ? string.Empty : paginationObj.searchTerm);
+
+                if (response != null && response.Count > 0)
+                {
+                    responseModel = new UserListVM()
+                    {
+                        TotalCount = response != null ? (response[0].TotalCount.HasValue ? response[0].TotalCount.Value : 0) : 0,
+                        UserList = response,
+                        user = new CreateUserViewModel() { lstUsrType = GetUserType() }
+
+                    };
+                }
+                else
+                {
+                    responseModel = new UserListVM()
+                    {
+                        TotalCount = 0,
+                        UserList = null,
+                        user = new CreateUserViewModel() { lstUsrType = GetUserType() }
+                    };
+                }
+
+                return PartialView("_UserList", responseModel);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message, ex);
+                return PartialView("_UserList", responseModel);
+            }
+        }
+        [HttpPost("GetuserDetail")]
+        public async Task<JsonResult> GetuserDetail(string data, string key, string nonce)
+        {
+            try
+            {
+                string decryptedKey = Helper.DecryptUserInput(key, HttpContext.Session.GetString("PrivateKey"));
+                string decryptedSalt = Helper.DecryptUserInput(nonce, HttpContext.Session.GetString("PrivateKey"));
+                AjaxRequestModel ajaxModel = Helper.DecryptAESGCM<AjaxRequestModel>(data, decryptedKey, decryptedSalt);
+                if (ajaxModel.userId == 0)
+                {
+                    return Json(new UserMaster());
+                }
+                var response = await _accountService.GetUserDetail(ajaxModel.userId);
+
+                return Json(response);
+            }
+            catch (Exception ex)
+            {
+                return Json(ex.Message);
+            }
+
+        }
+
+
+        [HttpGet("UserCreation")]
+        public async Task<IActionResult> Create()
+        {
+            CreateUserViewModel model = new CreateUserViewModel();
+            model.lstUsrType = GetUserType();
+            return View(model);
+        }
+        [HttpPost("UserCreation")]
+        public async Task<IActionResult> Create(string data, string key, string nonce)
+        {
+            string decryptedKey = Helper.DecryptUserInput(key, HttpContext.Session.GetString("PrivateKey"));
+            string decryptedSalt = Helper.DecryptUserInput(nonce, HttpContext.Session.GetString("PrivateKey"));
+            CreateUserViewModel model = Helper.DecryptAESGCM<CreateUserViewModel>(data, decryptedKey, decryptedSalt);
+            model.EncodedDate = DateTime.Now;
+            model.EncodedBy = ConvertTo.Integer(HttpContext.Session.GetString("PortalUserId"));
+            var result = await _accountService.CreateUser(model);
+            return Json(new { Status = result.Status, Message = result.Message });
+        }
+
+        [HttpGet("CheckUsernameAvailability")]
+        public async Task<bool> CheckUsernameAvailability(string UserName)
+        {
+            var user = await _accountService.CheckUsernameAvailability(UserName);
+            if (user != null && ConvertTo.Integer(user) > 0)
+            {
+                return false;
+            }
+            else
+            {
+                return true;
+            }
+        }
+
+        private List<SelectListItem> GetUserType()
+        {
+            List<SelectListItem> UserTypeList = new List<SelectListItem>();
+
+            UserTypeList = new List<SelectListItem>
+            {
+             new SelectListItem { Text = "Select User Type", Value = "0", Selected = true },
+            new SelectListItem() {Text="Admin", Value="2"},
+            new SelectListItem() {Text="User", Value="3"}
+            };
+            return UserTypeList;
         }
     }
 
-    static string GetLastExecutedChangeset(string connectionString)
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+using HMISAdminPortal.Areas.Shared;
+using HMISAdminPortal.Areas.Shared.Model;
+using HMISAdminPortal.DAL.Common.Enums;
+using HMISAdminPortal.DAL.DTOs.RequestDTOs;
+using HMISAdminPortal.DAL.ViewModels.Common;
+using HMISAdminPortal.DAL.ViewModels.UserRights;
+using HMISAdminPortal.Web.Filters;
+using HMISAdminPortal.Web.Helpers;
+using HMISAdminPortal.Web.Services;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Rendering;
+using Newtonsoft.Json;
+
+namespace HMISAdminPortal.Web.Areas.UserRights.Controller
+{
+
+    [Area("UserConfiguration")]
+    [TypeFilter(typeof(CustomAuthorisationFilter), Arguments = [new int[] { (int)UserModuleEnum.Module.UserRights }])]
+    public class UserRightsController : BasicController
     {
-        string changesetId = "";
-        using (SqlConnection conn = new SqlConnection(connectionString))
+        private readonly ILogger<UserRightsController> _logger;
+        private readonly UserConfigurationService _userConfigurationService;
+        public UserRightsController(ILogger<UserRightsController> logger, BaseDependency baseDependency, UserConfigurationService userConfigurationService) : base(baseDependency)
         {
-            conn.Open();
-            using (SqlCommand cmd = new SqlCommand("SELECT Value FROM ItemKeys WHERE Name = 'LastExecutedChangeset'", conn))
-            {
-                object result = cmd.ExecuteScalar();
-                if (result != null)
-                    changesetId = result.ToString();
-            }
+            _logger = logger;
+            _userConfigurationService = userConfigurationService;
         }
-        return changesetId;
+
+        [Route("UserRights")]
+        public async Task<IActionResult> Index()
+        {
+            UserRightsVM userRightsVM = new();
+            try
+            {
+                int portalUserId = ConvertTo.Integer(HttpContext.Session.GetString("PortalUserId"));
+                List<SelectListVM> lstUserTypes = await _userConfigurationService.GetUserTypes(portalUserId);
+                userRightsVM.UserType = new();
+                userRightsVM.UserNameList = new();
+                userRightsVM.UserType.Add(new SelectListItem { Text = "Select User Type", Value = "", Selected = true });
+                userRightsVM.UserNameList.Add(new SelectListItem { Text = "Select User Name", Value = "", Selected = true });
+                foreach (SelectListVM lst in lstUserTypes)
+                {
+                    userRightsVM.UserType.Add(new SelectListItem { Text = lst.Text, Value = lst.Value });
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message);
+            }
+            return View(userRightsVM);
+        }
+
+        [HttpGet]
+        public async Task<IActionResult> BindUserNames(string data, string key, string nonce)
+        {
+            try
+            {
+                string decryptedKey = Helper.DecryptUserInput(key, HttpContext.Session.GetString("PrivateKey"));
+                string decryptedSalt = Helper.DecryptUserInput(nonce, HttpContext.Session.GetString("PrivateKey"));
+                AjaxRequestModel ajaxModel = Helper.DecryptAESGCM<AjaxRequestModel>(data, decryptedKey, decryptedSalt);
+                UserRightsVM userRights = new();
+                List<SelectListVM> lstUsernames = await _userConfigurationService.GetUsernames(ajaxModel.UserType);
+                userRights.UserNameList = new();
+                userRights.UserNameList.Add(new SelectListItem { Text = "Select User Name", Value = "", Selected = true });
+                if (lstUsernames == null)
+                {
+                    return new JsonResult(new CustomJsonResult { IsSuccess = false, Data = userRights.UserNameList });
+                }
+                foreach (SelectListVM lst in lstUsernames)
+                {
+                    userRights.UserNameList.Add(new SelectListItem { Text = lst.Text, Value = lst.Value });
+                }
+                return new JsonResult(new CustomJsonResult { IsSuccess = true, Data = userRights.UserNameList });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message);
+            }
+            return new JsonResult(new CustomJsonResult { IsSuccess = false, Data = null });
+        }
+        
+        [HttpPost("UserRights")]
+        public async Task<IActionResult> Index(UserRightsVM? userRights)
+        {
+            try
+            {
+                userRights.PortalUserId = ConvertTo.Integer(HttpContext.Session.GetString("PortalUserId"));
+                userRights = await _userConfigurationService.GetAccessRightsInfo(JsonConvert.DeserializeObject<UserRightsRequestDto>(JsonConvert.SerializeObject(userRights)));
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message);
+            }
+            ModelState.Clear();
+            return View(userRights);
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> SaveData(UserRightsVM userRights)
+        {
+            try
+            {
+                userRights.PortalUserId = ConvertTo.Integer(HttpContext.Session.GetString("PortalUserId"));
+                bool response = await _userConfigurationService.SaveAccessRightsInfo(JsonConvert.DeserializeObject<UserRightsRequestDto>(JsonConvert.SerializeObject(userRights)));
+                TempData["AlertMessge"] = (response ? "1" : "0");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message);
+            }
+
+            return RedirectToAction("Index");
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> NewData()
+        {
+            return RedirectToAction("Index");
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> CancelAccessRights()
+        {
+            return RedirectToAction("Index", "Home", new { area = "MainMasters" });
+        }
     }
+}
 
-    static void ExecuteSQLFile(string filePath, string connectionString)
+
+
+
+
+
+
+ Download_ShouldReturnFile
+   Source: ABDMControllerTests.cs line 101
+   Duration: 77 ms
+
+  Message: 
+System.ArgumentException : Can not instantiate proxy of class: HMISAdminPortal.Web.Services.ABDMConnectorService.
+Could not find a parameterless constructor. (Parameter 'constructorArguments')
+  ----> System.MissingMethodException : Constructor on type 'Castle.Proxies.ABDMConnectorServiceProxy' not found.
+
+  Stack Trace: 
+ProxyGenerator.CreateClassProxyInstance(Type proxyType, List`1 proxyArguments, Type classToProxy, Object[] constructorArguments)
+ProxyGenerator.CreateClassProxy(Type classToProxy, Type[] additionalInterfacesToProxy, ProxyGenerationOptions options, Object[] constructorArguments, IInterceptor[] interceptors)
+CastleProxyFactory.CreateProxy(Type mockType, IInterceptor interceptor, Type[] interfaces, Object[] arguments) line 110
+Mock`1.InitializeInstance() line 502
+Mock`1.OnGetObject() line 516
+Mock.get_Object() line 180
+Mock`1.get_Object() line 453
+ABDMControllerTests.Setup() line 32
+RuntimeMethodHandle.InvokeMethod(Object target, Void** arguments, Signature sig, Boolean isConstructor)
+MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+--MissingMethodException
+RuntimeType.CreateInstanceImpl(BindingFlags bindingAttr, Binder binder, Object[] args, CultureInfo culture)
+ProxyGenerator.CreateClassProxyInstance(Type proxyType, List`1 proxyArguments, Type classToProxy, Object[] constructorArguments)
+
+
+
+
+using HMISAdminPortal.DAL.DTOs.Entity;
+using HMISAdminPortal.Web.Areas.ABDMConnector.Controller;
+using HMISAdminPortal.Web.Services;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
+using Moq;
+using NUnit.Framework;
+
+namespace HMISAdminPortal.API.Test.Web.Controllers.Test
+{
+    [TestFixture]
+    public class ABDMControllerTests
     {
-        if (!File.Exists(filePath))
+        private Mock<ABDMConnectorService> _mockConnectorService;
+        private Mock<PaymentServices> _mockPaymentServices;
+        private Mock<ILogger<ABDMController>> _mockLogger;
+        private Mock<IHostingEnvironment> _mockHostingEnvironment;
+        private ABDMController _controller;
+
+        /// <summary>
+        /// Setup class for ABDMController
+        /// </summary>
+        [SetUp]
+        public void Setup()
         {
-            Console.WriteLine("SQL file not found!");
-            return;
+            _mockConnectorService = new Mock<ABDMConnectorService>();
+            _mockPaymentServices = new Mock<PaymentServices>();
+            _mockLogger = new Mock<ILogger<ABDMController>>();
+            _mockHostingEnvironment = new Mock<IHostingEnvironment>();
+
+            _controller = new ABDMController(
+                _mockConnectorService.Object,
+                _mockPaymentServices.Object,
+                _mockLogger.Object,
+                _mockHostingEnvironment.Object,
+                null);
         }
 
-        string sqlCommands = File.ReadAllText(filePath);
-        using (SqlConnection conn = new SqlConnection(connectionString))
+        /// <summary>
+        /// Return Index View Result
+        /// </summary>
+        [Test]
+        public async Task Index_ReturnsViewResult()
         {
-            conn.Open();
-            using (SqlCommand cmd = conn.CreateCommand())
-            {
-                cmd.CommandText = sqlCommands;
-                cmd.ExecuteNonQuery();
-            }
+            _mockConnectorService.Setup(x => x.GetABDMConnectorList(It.IsAny<int>(), It.IsAny<int>(), It.IsAny<string>(), It.IsAny<int>(), It.IsAny<string>())).ReturnsAsync(new List<ABDMConnectorModel>());
+            var result = await _controller.Index();
+            Assert.IsInstanceOf<ViewResult>(result);
         }
-        Console.WriteLine("SQL Execution Completed.");
-    }
 
-    static void UpdateLastExecutedChangeset(string connectionString, string newChangeset)
-    {
-        using (SqlConnection conn = new SqlConnection(connectionString))
+        /// <summary>
+        /// Return Json Result while success
+        /// </summary>
+        [Test]
+        public async Task SaveConnectorDetail_ReturnsJsonSuccess()
         {
-            conn.Open();
-            using (SqlCommand cmd = new SqlCommand(@"
-                IF EXISTS (SELECT * FROM ItemKeys WHERE Name = 'LastExecutedChangeset')
-                    UPDATE ItemKeys SET Value = @newChangeset WHERE Name = 'LastExecutedChangeset'
-                ELSE
-                    INSERT INTO ItemKeys (Name, Value, LocationId) VALUES ('LastExecutedChangeset', @newChangeset, 1)", conn))
-            {
-                cmd.Parameters.AddWithValue("@newChangeset", newChangeset);
-                cmd.ExecuteNonQuery();
-            }
+            _mockConnectorService.Setup(x => x.SaveConnectorDetail(It.IsAny<ABDMConnectorModel>())).ReturnsAsync(1);
+            var result = await _controller.SaveConnectorDetail("data", "key", "nonce") as JsonResult;
+            dynamic jsonData = result.Value;
+            Assert.IsTrue(jsonData.success);
         }
+
+        /// <summary>
+        /// Return Json Result while Already exists case
+        /// </summary>
+        [Test]
+        public async Task SaveConnectorDetail_ReturnsJsonError_WhenDuplicate()
+        {
+            _mockConnectorService.Setup(x => x.SaveConnectorDetail(It.IsAny<ABDMConnectorModel>())).ReturnsAsync(-2);
+            var result = await _controller.SaveConnectorDetail("data", "key", "nonce") as JsonResult;
+            dynamic jsonData = result.Value;
+            Assert.IsFalse(jsonData.success);
+        }
+
+        /// <summary>
+        /// GetConnectorDetail Return Json Result
+        /// </summary>
+        [Test]
+        public async Task GetConnectorDetail_ReturnsJsonResult()
+        {
+            _mockConnectorService.Setup(x => x.GetConnectorDetail(It.IsAny<int>())).ReturnsAsync(new ABDMConnectorModel());
+            var result = await _controller.GetConnectorDetail("data", "key", "nonce") as JsonResult;
+            Assert.IsNotNull(result);
+        }
+
+        /// <summary>
+        /// UploadExcel when file is null
+        /// </summary>
+        [Test]
+        public async Task UploadExcel_ReturnsJsonWhenFileIsNull()
+        {
+            var result = await _controller.UploadExcel(null) as JsonResult;
+            dynamic jsonData = result.Value;
+            Assert.IsFalse(jsonData.success);
+        }
+
+        /// <summary>
+        /// Download return file
+        /// </summary>
+        [Test]
+        public void Download_ShouldReturnFile()
+        {
+            _mockHostingEnvironment.Setup(x => x.WebRootPath).Returns("D:\\TestPath");
+            File.WriteAllText("D:\\TestPath\\DownloadUploadExcelResult\\ExcelUploadResult.txt", "Test Content");
+            var result = _controller.Download() as FileContentResult;
+            Assert.NotNull(result);
+            Assert.AreEqual("text/plain", result.ContentType);
+            Assert.AreEqual("ExcelUploadResult.txt", result.FileDownloadName);
+        }
+
+        /// <summary>
+        /// GetExcel return file
+        /// </summary>
+        [Test]
+        public async Task GetExcel_ShouldReturnFile()
+        {
+            _mockConnectorService.Setup(x => x.GetConnectorUsageReport(It.IsAny<int>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), 0, 0)).ReturnsAsync(new ConnectorUsageReportViewModel { UsageReportList = new List<ConnectorUsageReportDTO>() });
+            var result = await _controller.GetExcel(1, "2024-01-01", "2024-12-31", "N");
+            Assert.NotNull(result);
+            Assert.AreEqual("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", result.ContentType);
+        }
+
+        // Not possible due to UploadExcelAndSave protection level
+        //[Test]
+        //public async Task UploadExcelAndSave_ShouldReturnError_WhenDataIsInvalid()
+        //{
+        //    var invalidList = new List<ABDMConnectorExcelUploadModel>
+        //        {
+        //            new ABDMConnectorExcelUploadModel { APIBaseURL = "", ClientName = "" } // Invalid Data
+        //        };
+        //    StringBuilder result = await _controller.UploadExcelAndSave(invalidList);
+        //    Assert.IsNotEmpty(result.ToString());
+        //}
     }
 }
