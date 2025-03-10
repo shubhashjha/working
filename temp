@@ -1,0 +1,296 @@
+using System;
+using System.Data.SqlClient;
+using System.IO;
+using System.Linq;
+
+class Program
+{
+    static void Main()
+    {
+        string connectionString = "Server=ATLANTISPC-784\\SQLEXPRESS;Database=10.0.37;User Id=HMIS;Password=ecw@123;";
+        string destinationFile = @"D:\Build\10_0_37\10_0_37_22_Upgrade\Changes_Sql_Version.txt";
+        string sourceFile = @"D:\Build\10_0_37\10_0_37_22_Upgrade\Changes_Sql.txt";
+
+        try
+        {
+            // 1. Get Last HMIS Version
+            string lastVersion = GetLastHMISVersion(connectionString);
+            Console.WriteLine($"LastVersion from DB: {lastVersion}");
+
+            // 2. Extract main version (e.g., 11.82.4 → 11.82)
+            string editedLastVersion = ExtractMainVersion(lastVersion);
+            Console.WriteLine($"Edited Last Version: {editedLastVersion}");
+
+            // 3. Check if the version exists in the source file
+            string versionMarker = $"version:{editedLastVersion}";
+            string[] lines = File.ReadAllLines(sourceFile);
+            int versionIndex = Array.FindIndex(lines, line => line.Contains(versionMarker));
+
+            if (File.Exists(destinationFile))
+                File.Delete(destinationFile);
+
+            if (versionIndex == -1)
+            {
+                // If version not found, copy the entire file
+                File.Copy(sourceFile, destinationFile);
+                Console.WriteLine("Version not found, copied entire file.");
+            }
+            else
+            {
+                // Copy lines from found version onward
+                File.WriteAllLines(destinationFile, lines.Skip(versionIndex));
+                Console.WriteLine($"Version found at line {versionIndex}, copied from this point onward.");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error: {ex.Message}");
+        }
+    }
+
+    static string GetLastHMISVersion(string connectionString)
+    {
+        string version = "";
+        using (SqlConnection conn = new SqlConnection(connectionString))
+        {
+            conn.Open();
+            using (SqlCommand cmd = new SqlCommand("SELECT Value FROM ItemKeys WHERE Name = 'Server_Version'", conn))
+            {
+                object result = cmd.ExecuteScalar();
+                if (result != null)
+                    version = result.ToString();
+            }
+        }
+        return version;
+    }
+
+    static string ExtractMainVersion(string version)
+    {
+        if (string.IsNullOrWhiteSpace(version))
+            return "";
+
+        string[] parts = version.Split('.');
+        return parts.Length > 2 ? string.Join(".", parts.Take(2)) : version;
+    }
+}
+
+
+
+
+
+
+
+
+using System;
+using System.Data.SqlClient;
+using System.IO;
+using System.Linq;
+using System.Text.RegularExpressions;
+
+class Program
+{
+    static void Main()
+    {
+        string connectionString = "Server=ATLANTISPC-784\\SQLEXPRESS;Database=10.0.37;User Id=HMIS;Password=ecw@123;";
+        string sourceFile = @"D:\Build\10_0_37\10_0_37_22_Upgrade\Changes_Sql.txt";
+
+        try
+        {
+            // 1. Get Last Executed Changeset ID
+            string lastExecutedChangeset = GetLastExecutedChangeset(connectionString);
+            Console.WriteLine($"Last Executed Changeset: {lastExecutedChangeset}");
+
+            // 2. Read SQL File & Find Next Execution Start Point
+            string[] lines = File.ReadAllLines(sourceFile);
+            int startIndex = FindNextChangesetIndex(lines, lastExecutedChangeset);
+
+            if (startIndex == -1)
+            {
+                Console.WriteLine("No new changesets to execute.");
+                return;
+            }
+
+            // 3. Extract SQL Statements after the last executed changeset
+            string sqlToExecute = string.Join(Environment.NewLine, lines.Skip(startIndex));
+
+            // 4. Execute SQL Statements
+            ExecuteSQL(sqlToExecute, connectionString);
+
+            // 5. Update Last Executed Changeset in DB
+            string newLastChangeset = ExtractLastChangeset(sqlToExecute);
+            if (!string.IsNullOrEmpty(newLastChangeset))
+            {
+                UpdateLastExecutedChangeset(connectionString, newLastChangeset);
+                Console.WriteLine($"Updated Last Executed Changeset to: {newLastChangeset}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error: {ex.Message}");
+        }
+    }
+
+    static string GetLastExecutedChangeset(string connectionString)
+    {
+        string changesetId = "";
+        using (SqlConnection conn = new SqlConnection(connectionString))
+        {
+            conn.Open();
+            using (SqlCommand cmd = new SqlCommand("SELECT Value FROM ItemKeys WHERE Name = 'LastExecutedChangeset'", conn))
+            {
+                object result = cmd.ExecuteScalar();
+                if (result != null)
+                    changesetId = result.ToString();
+            }
+        }
+        return changesetId;
+    }
+
+    static int FindNextChangesetIndex(string[] lines, string lastChangeset)
+    {
+        if (string.IsNullOrWhiteSpace(lastChangeset))
+            return 0; // Execute from the beginning if no previous changeset exists
+
+        for (int i = 0; i < lines.Length; i++)
+        {
+            if (lines[i].Contains($"--changeset") && lines[i].Contains(lastChangeset))
+            {
+                return i + 1; // Start from the next line after the matched changeset
+            }
+        }
+        return -1;
+    }
+
+    static void ExecuteSQL(string sqlCommands, string connectionString)
+    {
+        using (SqlConnection conn = new SqlConnection(connectionString))
+        {
+            conn.Open();
+            using (SqlCommand cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sqlCommands;
+                cmd.ExecuteNonQuery();
+            }
+        }
+        Console.WriteLine("SQL Execution Completed.");
+    }
+
+    static string ExtractLastChangeset(string sqlContent)
+    {
+        var match = Regex.Match(sqlContent, @"--changeset\s+[^\s:]+:(\d+)");
+        return match.Success ? match.Groups[1].Value : "";
+    }
+
+    static void UpdateLastExecutedChangeset(string connectionString, string newChangeset)
+    {
+        using (SqlConnection conn = new SqlConnection(connectionString))
+        {
+            conn.Open();
+            using (SqlCommand cmd = new SqlCommand(@"
+                IF EXISTS (SELECT * FROM ItemKeys WHERE Name = 'LastExecutedChangeset')
+                    UPDATE ItemKeys SET Value = @newChangeset WHERE Name = 'LastExecutedChangeset'
+                ELSE
+                    INSERT INTO ItemKeys (Name, Value, LocationId) VALUES ('LastExecutedChangeset', @newChangeset, 1)", conn))
+            {
+                cmd.Parameters.AddWithValue("@newChangeset", newChangeset);
+                cmd.ExecuteNonQuery();
+            }
+        }
+    }
+}
+
+
+
+
+using System;
+using System.Data.SqlClient;
+using System.IO;
+
+class Program
+{
+    static void Main()
+    {
+        string connectionString = "Server=ATLANTISPC-784\\SQLEXPRESS;Database=10.0.37;User Id=HMIS;Password=ecw@123;";
+        string sqlFilePath = @"D:\Build\10_0_37\10_0_37_22_Upgrade\New_Changes.sql"; // Manually prepared SQL file
+        string latestChangesetId = "14062017180002"; // Manually set new changeset ID
+
+        try
+        {
+            // Get Last Executed Changeset
+            string lastExecutedChangeset = GetLastExecutedChangeset(connectionString);
+            Console.WriteLine($"Last Executed Changeset: {lastExecutedChangeset}");
+
+            // Check if there's a newer changeset
+            if (string.Compare(latestChangesetId, lastExecutedChangeset) <= 0)
+            {
+                Console.WriteLine("No new changesets to execute.");
+                return;
+            }
+
+            // Execute the manually prepared SQL script
+            ExecuteSQLFile(sqlFilePath, connectionString);
+
+            // Update the last executed changeset in the database
+            UpdateLastExecutedChangeset(connectionString, latestChangesetId);
+            Console.WriteLine($"Updated Last Executed Changeset to: {latestChangesetId}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error: {ex.Message}");
+        }
+    }
+
+    static string GetLastExecutedChangeset(string connectionString)
+    {
+        string changesetId = "";
+        using (SqlConnection conn = new SqlConnection(connectionString))
+        {
+            conn.Open();
+            using (SqlCommand cmd = new SqlCommand("SELECT Value FROM ItemKeys WHERE Name = 'LastExecutedChangeset'", conn))
+            {
+                object result = cmd.ExecuteScalar();
+                if (result != null)
+                    changesetId = result.ToString();
+            }
+        }
+        return changesetId;
+    }
+
+    static void ExecuteSQLFile(string filePath, string connectionString)
+    {
+        if (!File.Exists(filePath))
+        {
+            Console.WriteLine("SQL file not found!");
+            return;
+        }
+
+        string sqlCommands = File.ReadAllText(filePath);
+        using (SqlConnection conn = new SqlConnection(connectionString))
+        {
+            conn.Open();
+            using (SqlCommand cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = sqlCommands;
+                cmd.ExecuteNonQuery();
+            }
+        }
+        Console.WriteLine("SQL Execution Completed.");
+    }
+
+    static void UpdateLastExecutedChangeset(string connectionString, string newChangeset)
+    {
+        using (SqlConnection conn = new SqlConnection(connectionString))
+        {
+            conn.Open();
+            using (SqlCommand cmd = new SqlCommand(@"
+                IF EXISTS (SELECT * FROM ItemKeys WHERE Name = 'LastExecutedChangeset')
+                    UPDATE ItemKeys SET Value = @newChangeset WHERE Name = 'LastExecutedChangeset'
+                ELSE
+                    INSERT INTO ItemKeys (Name, Value, LocationId) VALUES ('LastExecutedChangeset', @newChangeset, 1)", conn))
+            {
+                cmd.Parameters.AddWithValue("@newChangeset", newChangeset);
+                cmd.ExecuteNonQuery();
+            }
+        }
+    }
+}
